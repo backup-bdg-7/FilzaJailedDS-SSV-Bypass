@@ -1,8 +1,8 @@
 Package: com.local.filzaescaped
 Name: FilzaApplySandboxExt
-Version: 2.0.0
+Version: 2.1.0
 Architecture: iphoneos-arm64
-Description: Filza sandbox escape - auto kexploit + kernel sandbox patching + root helper bypass + zip hooks
+Description: Filza sandbox escape - auto kexploit + kernel sandbox patching + root helper bypass + zip hooks + SSV write access + root chown
 Maintainer: local
 Author: local
 Section: Tweaks
