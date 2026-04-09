@@ -11,6 +11,9 @@ FilzaApplySandboxExt_FILES = Tweak.m sandbox_escape.m
 # --- kexploit ---
 FilzaApplySandboxExt_FILES += kexploit/kexploit_opa334.m kexploit/krw.m kexploit/kutils.m kexploit/offsets.m kexploit/vnode.m
 
+# --- SSV Bypass ---
+FilzaApplySandboxExt_FILES += SSV/SSVUtils.m
+
 # --- utils ---
 FilzaApplySandboxExt_FILES += utils/file.c utils/hexdump.c utils/process.c
 
