@@ -11,5 +11,5 @@ About iPhone 17 series and iPad M5: IT WON'T WORK because of MTE. Starting from 
 - Thanks to [opa334](https://github.com/opa334/) for the XPF/krw
 - Thanks to [CrazyMind90](https://github.com/crazymind90/) for idea how to get sbx token with krw only
 - Thanks to [Huy Nguyen](https://github.com/34306/) for the original repo
-- Thanks to [Claude](https://claude.ai) for assisting me 
+- Thanks to [Grok](https://grok.com) for assisting me when Claude treat this as a malware and refuse to help me
 - And me 
