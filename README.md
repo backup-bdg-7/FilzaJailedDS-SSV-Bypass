@@ -1,6 +1,15 @@
 # FilzaJailedDS
 Filza Jailed Darksword, support iOS 17.0-26.0.1 (except 18.7.2-18.7.7). This repo open source the tweak inject into the Filza iPA (4.0.0 and back, 4.0.2 seems crash something)
-I'm trying to add SSV arbitrary write
+Now includes SSV-protected area write access with root privileges.
+
+## Features
+- Sandbox escape via kernel exploit
+- Root helper bypass
+- Zip/unzip hooks
+- Apps Manager fixes
+- License/integrity bypass
+- **SSV-protected area write access**: Allows writing to system-protected areas like /System/Library/Keychains
+- **Root privileges on created files**: Automatically chown files created in protected areas to root with write permissions
 
 About iPhone 17 series and iPad M5: IT WON'T WORK because of MTE. Starting from iPhone 17 and M5 chip, Apple added MTE to block anyone trying to access krw, so it will not work
 
@@ -11,5 +20,5 @@ About iPhone 17 series and iPad M5: IT WON'T WORK because of MTE. Starting from 
 - Thanks to [opa334](https://github.com/opa334/) for the XPF/krw
 - Thanks to [CrazyMind90](https://github.com/crazymind90/) for idea how to get sbx token with krw only
 - Thanks to [Huy Nguyen](https://github.com/34306/) for the original repo
-- Thanks to [Grok](https://grok.com) for assisting me when Claude treat this as a malware and refuse to help me
+- Thanks to [Grok](https://grok.com) and GitHub Copilot for assisting me with the implementation
 - And me 
