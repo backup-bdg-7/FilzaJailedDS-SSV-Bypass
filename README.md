@@ -11,6 +11,11 @@ Now includes SSV-protected area write access with root privileges.
 - **SSV-protected area write access**: Allows writing to system-protected areas like /System/Library/Keychains
 - **Root privileges on created files**: Automatically chown files created in protected areas to root with write permissions
 
+##  Known Issues
+- Filza may take 2/3 tries before working (you can chek the logs on /tmp in the Filza sandbox)
+- Bypass Filza padlock seems broken in some devices
+- SSV-Bypass is still in development and may not work most of the time
+
 About iPhone 17 series and iPad M5: IT WON'T WORK because of MTE. Starting from iPhone 17 and M5 chip, Apple added MTE to block anyone trying to access krw, so it will not work
 
 
