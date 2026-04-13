@@ -6,7 +6,7 @@ Now includes SSV-protected area write access with root privileges.
 - Sandbox escape via kernel exploit
 - Root helper bypass
 - Zip/unzip hooks
-- Apps Manager fixes
+- Bypass Filza padlock: lets you TRY to create and edit file even without permission
 - License/integrity bypass
 - **SSV-protected area write access**: Allows writing to system-protected areas like /System/Library/Keychains
 - **Root privileges on created files**: Automatically chown files created in protected areas to root with write permissions
