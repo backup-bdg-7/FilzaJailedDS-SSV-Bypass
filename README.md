@@ -16,6 +16,7 @@ Now includes SSV-protected area write access with root privileges.
 
 ## Known Issues
 - Filza may take 2–3 attempts before working (you can check the logs in "/tmp" inside the Filza sandbox)
+- Bypass Filza padlock doesn't work
 
 ## WARNING
 This is a pre-release build. Most exploits are still unstable and do not always work.  
