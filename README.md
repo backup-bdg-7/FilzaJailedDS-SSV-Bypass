@@ -16,6 +16,10 @@ Now includes SSV-protected area write access with root privileges.
 - Bypass Filza padlock seems broken in some devices
 - SSV-Bypass is still in development and may not work most of the time
 
+## WARNING
+This is a pre-release build, so most of the exploits are still broken and don't always work. This build is for testing purpose, do not expect it to works perfecly, if you test this and it ends up working please contact [me](https://x.com/XEmaz_) with your logs, if it doesn't work make a issue on github if you want but do NOT contac me this is a pre-release for testing.
+
+
 About iPhone 17 series and iPad M5: IT WON'T WORK because of MTE. Starting from iPhone 17 and M5 chip, Apple added MTE to block anyone trying to access krw, so it will not work
 
 
