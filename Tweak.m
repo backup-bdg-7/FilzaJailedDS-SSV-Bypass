@@ -1,13 +1,32 @@
 @import UIKit;
+#import <stdbool.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <xpc/xpc.h>
+#include <stdio.h>
+#include <stdarg.h>
+#include <time.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <string.h>
+#include <errno.h>
 
 #include "kexploit/kexploit_opa334.h"
 #include "kexploit/kutils.h"
 #include "kexploit/sandbox.h"
 #include "sandbox_escape.h"
 #include "SSV/SSVUtils.h"
+#import "FilzaPadlockBypass.h"
+#import "utils/permission_utils.h"
+
+bool g_exploitDone = false;
+bool g_patching_in_progress = false;
+
+static const char *getTweakLogPath(void);
+static void TweakLog(const char *format, ...);
+static void runSSVDiagnosticsOnce(void);
 
 #pragma mark - Root Helper Hooks
 
@@ -483,24 +502,372 @@ static void hook_activationViewDidLoad(id self, SEL _cmd) {
 
 #pragma mark - SSV Hooks
 
+static BOOL pathMatchesProtectedRoot(NSString *path, NSString *root) {
+    if ([path isEqualToString:root]) return YES;
+    return ([path hasPrefix:root] && [path characterAtIndex:root.length] == '/');
+}
+
+static BOOL ssvProtectedPath(NSString *path) {
+    if (!path || path.length == 0) return NO;
+    return pathMatchesProtectedRoot(path, @"/System") ||
+           pathMatchesProtectedRoot(path, @"/Applications") ||
+           pathMatchesProtectedRoot(path, @"/usr") ||
+           pathMatchesProtectedRoot(path, @"/sbin") ||
+           pathMatchesProtectedRoot(path, @"/bin") ||
+           pathMatchesProtectedRoot(path, @"/Library") ||
+           pathMatchesProtectedRoot(path, @"/dev") ||
+           pathMatchesProtectedRoot(path, @"/var") ||
+           pathMatchesProtectedRoot(path, @"/private/var");
+}
+
+static BOOL sealedSystemPath(NSString *path) {
+    if (!path || path.length == 0) return NO;
+    return pathMatchesProtectedRoot(path, @"/System") ||
+           pathMatchesProtectedRoot(path, @"/bin") ||
+           pathMatchesProtectedRoot(path, @"/sbin") ||
+           pathMatchesProtectedRoot(path, @"/usr") ||
+           pathMatchesProtectedRoot(path, @"/dev");
+}
+
+static BOOL g_ssv_active = NO;
+static BOOL g_ssv_activation_attempt_inflight = NO;
+static uint64_t g_last_ssv_activation_attempt_ms = 0;
+
+// UI debug mode: make Filza behave as writable everywhere for testing/logging.
+// This does not guarantee real kernel/filesystem write privileges.
+static BOOL g_ui_debug_bypass = YES;
+
+static NSString *uiDebugBypassOnFlagPath(void) {
+    NSString *docs = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
+    return [docs stringByAppendingPathComponent:@"ui_debug_bypass_on.flag"];
+}
+
+static NSString *uiDebugBypassOffFlagPath(void) {
+    NSString *docs = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
+    return [docs stringByAppendingPathComponent:@"ui_debug_bypass_off.flag"];
+}
+
+static void refreshUIDebugBypassFlag(void) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *onPath = uiDebugBypassOnFlagPath();
+    NSString *offPath = uiDebugBypassOffFlagPath();
+    BOOL hasOn = [fm fileExistsAtPath:onPath];
+    BOOL hasOff = [fm fileExistsAtPath:offPath];
+
+    if (hasOff) {
+        g_ui_debug_bypass = NO;
+    } else if (hasOn) {
+        g_ui_debug_bypass = YES;
+    } else {
+        // Default to enabled for easier testing unless user explicitly disables.
+        g_ui_debug_bypass = YES;
+    }
+    TweakLog("[SSV][UI] bypass=%d (onFlag=%s offFlag=%s)",
+             g_ui_debug_bypass,
+             [onPath UTF8String],
+             [offPath UTF8String]);
+}
+
+static BOOL pathIsInsideAppContainer(NSString *path) {
+    if (!path || path.length == 0) return NO;
+    NSString *home = NSHomeDirectory();
+    if (!home || home.length == 0) return NO;
+    if ([path isEqualToString:home]) return YES;
+    return ([path hasPrefix:home] && [path characterAtIndex:home.length] == '/');
+}
+
+static void applyParentOwnershipAndPerms(NSString *path) {
+    if (!path || path.length == 0) return;
+    NSString *parent = [path stringByDeletingLastPathComponent];
+    if (!parent || parent.length == 0) return;
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSError *parentErr = nil;
+    NSDictionary *parentAttrs = [fm attributesOfItemAtPath:parent error:&parentErr];
+    if (!parentAttrs) {
+        TweakLog("[SSV] inherit attrs skip (parent attrs unavailable) path=%s parent=%s err=%s",
+                 [path UTF8String],
+                 [parent UTF8String],
+                 parentErr ? [parentErr.localizedDescription UTF8String] : "(null)");
+        return;
+    }
+
+    NSNumber *uid = parentAttrs[NSFileOwnerAccountID];
+    NSNumber *gid = parentAttrs[NSFileGroupOwnerAccountID];
+    NSNumber *perms = parentAttrs[NSFilePosixPermissions];
+
+    NSMutableDictionary *setAttrs = [NSMutableDictionary dictionary];
+    if (uid) setAttrs[NSFileOwnerAccountID] = uid;
+    if (gid) setAttrs[NSFileGroupOwnerAccountID] = gid;
+    if (perms) setAttrs[NSFilePosixPermissions] = perms;
+    if (setAttrs.count == 0) return;
+
+    NSError *setErr = nil;
+    BOOL ok = [fm setAttributes:setAttrs ofItemAtPath:path error:&setErr];
+    TweakLog("[SSV] inherit attrs path=%s parent=%s uid=%ld gid=%ld perms=%lo result=%d err=%s",
+             [path UTF8String],
+             [parent UTF8String],
+             (long)(uid ? uid.integerValue : -1),
+             (long)(gid ? gid.integerValue : -1),
+             (unsigned long)(perms ? perms.unsignedLongValue : 0),
+             ok,
+             setErr ? [setErr.localizedDescription UTF8String] : "(null)");
+
+    if (!ok && uid && uid.integerValue == 0 && ssvProtectedPath(path) && !pathIsInsideAppContainer(path)) {
+        TweakLog("[SSV] inherit attrs fallback ssv_chown_root for protected root-owned path: %s", [path UTF8String]);
+        ssv_chown_root([path UTF8String]);
+    }
+}
+
+static uint64_t now_ms(void) {
+    return (uint64_t)([[NSDate date] timeIntervalSince1970] * 1000.0);
+}
+
+static void ensureSSVActive(void) {
+    TweakLog("[SSV] ensureSSVActive start, active=%d", g_ssv_active);
+    if (g_ssv_active) return;
+    if (!g_exploitDone) {
+        TweakLog("[SSV] Exploit not done yet, cannot activate SSV");
+        return;
+    }
+    if (g_patching_in_progress) {
+        TweakLog("[SSV] Patch already in progress, skipping recursive call");
+        return;
+    }
+    if (g_ssv_activation_attempt_inflight) {
+        TweakLog("[SSV] Activation attempt already inflight, skipping");
+        return;
+    }
+    uint64_t now = now_ms();
+    if (g_last_ssv_activation_attempt_ms != 0 && (now - g_last_ssv_activation_attempt_ms) < 1500) {
+        TweakLog("[SSV] Activation throttled (%llums since last attempt)", now - g_last_ssv_activation_attempt_ms);
+        return;
+    }
+    g_ssv_activation_attempt_inflight = YES;
+    g_last_ssv_activation_attempt_ms = now;
+    int pret = patch_sandbox_ext();
+    g_ssv_activation_attempt_inflight = NO;
+    TweakLog("[SSV] ensureSSVActive patch_sandbox_ext returned %d", pret);
+    if (pret == 0) {
+        g_ssv_active = YES;
+        TweakLog("[SSV] ensureSSVActive set active=1");
+    }
+}
+
+static IMP orig_isWritableFileAtPath = NULL;
+static IMP orig_isReadableFileAtPath = NULL;
+static IMP orig_attributesOfItemAtPath_error = NULL;
+static IMP orig_createDirectoryAtPath = NULL;
+static IMP orig_copyItemAtPath_toPath_error = NULL;
+static IMP orig_moveItemAtPath_toPath_error = NULL;
+
+static BOOL hook_isWritableFileAtPath(id self, SEL _cmd, NSString *path) {
+    if (g_ui_debug_bypass) {
+        TweakLog("[SSV][UI] isWritableFileAtPath forced yes: %s", [path UTF8String]);
+        return YES;
+    }
+    if (ssvProtectedPath(path)) {
+        TweakLog("[SSV] isWritableFileAtPath override yes: %s", [path UTF8String]);
+        return YES;
+    }
+    return ((BOOL(*)(id,SEL,id))orig_isWritableFileAtPath)(self, _cmd, path);
+}
+
+static BOOL hook_isReadableFileAtPath(id self, SEL _cmd, NSString *path) {
+    if (g_ui_debug_bypass) {
+        TweakLog("[SSV][UI] isReadableFileAtPath forced yes: %s", [path UTF8String]);
+        return YES;
+    }
+    if (ssvProtectedPath(path)) {
+        TweakLog("[SSV] isReadableFileAtPath override yes: %s", [path UTF8String]);
+        return YES;
+    }
+    return ((BOOL(*)(id,SEL,id))orig_isReadableFileAtPath)(self, _cmd, path);
+}
+
+static NSDictionary *hook_attributesOfItemAtPath_error(id self, SEL _cmd, NSString *path, NSError **error) {
+    NSDictionary *result = ((NSDictionary *(*)(id,SEL,id,NSError**))orig_attributesOfItemAtPath_error)(self, _cmd, path, error);
+    if (result && (g_ui_debug_bypass || ssvProtectedPath(path))) {
+        NSMutableDictionary *mut = [result mutableCopy];
+        mut[NSFilePosixPermissions] = @0777;
+        if (!g_ui_debug_bypass) {
+            mut[NSFileOwnerAccountID] = @0;
+            mut[NSFileGroupOwnerAccountID] = @0;
+        }
+        if (mut[NSFileImmutable]) mut[NSFileImmutable] = @NO;
+        if (mut[NSFileAppendOnly]) mut[NSFileAppendOnly] = @NO;
+        TweakLog("[SSV]%s attributesOfItemAtPath override perms for %s",
+                 g_ui_debug_bypass ? "[UI]" : "",
+                 [path UTF8String]);
+        return mut;
+    }
+    return result;
+}
+
+static BOOL hook_createDirectoryAtPath(id self, SEL _cmd, NSString *path, BOOL createIntermediates, NSDictionary *attributes, NSError **error) {
+    BOOL protected = ssvProtectedPath(path);
+    NSError *localError = nil;
+    NSError **errRef = error ? error : &localError;
+
+    if (ssvProtectedPath(path)) {
+        if (g_exploitDone) {
+            ensureSSVActive();
+        }
+        TweakLog("[SSV] createDirectoryAtPath override for protected path: %s", [path UTF8String]);
+    }
+
+    BOOL result = ((BOOL(*)(id,SEL,id,BOOL,id,NSError**))orig_createDirectoryAtPath)(self, _cmd, path, createIntermediates, attributes, errRef);
+    if (result) {
+        applyParentOwnershipAndPerms(path);
+        if (protected) TweakLog("[SSV] createDirectoryAtPath success: %s", [path UTF8String]);
+        return YES;
+    }
+
+    int savedErrno = errno;
+    NSError *e = (errRef ? *errRef : nil);
+    if (protected) {
+        TweakLog("[SSV] createDirectoryAtPath failed path=%s errno=%d(%s) nsErr=%ld domain=%s desc=%s",
+                 [path UTF8String],
+                 savedErrno,
+                 strerror(savedErrno),
+                 (long)(e ? e.code : 0),
+                 e ? [e.domain UTF8String] : "(null)",
+                 e ? [e.localizedDescription UTF8String] : "(null)");
+    }
+
+    // Some callers use /var while APIs resolve internally under /private/var.
+    // If first attempt failed, retry once with canonicalized path.
+    if (protected && [path hasPrefix:@"/var/"]) {
+        NSString *altPath = [@"/private" stringByAppendingString:path];
+        NSError *altError = nil;
+        BOOL altResult = ((BOOL(*)(id,SEL,id,BOOL,id,NSError**))orig_createDirectoryAtPath)(self, _cmd, altPath, createIntermediates, attributes, &altError);
+        if (altResult) {
+            applyParentOwnershipAndPerms(altPath);
+            TweakLog("[SSV] createDirectoryAtPath fallback success: %s -> %s", [path UTF8String], [altPath UTF8String]);
+            if (errRef) *errRef = nil;
+            return YES;
+        }
+        int altErrno = errno;
+        TweakLog("[SSV] createDirectoryAtPath fallback failed alt=%s errno=%d(%s) nsErr=%ld domain=%s desc=%s",
+                 [altPath UTF8String],
+                 altErrno,
+                 strerror(altErrno),
+                 (long)(altError ? altError.code : 0),
+                 altError ? [altError.domain UTF8String] : "(null)",
+                 altError ? [altError.localizedDescription UTF8String] : "(null)");
+    }
+    if (g_ui_debug_bypass && protected && !sealedSystemPath(path)) {
+        TweakLog("[SSV][UI] createDirectoryAtPath simulated success for %s", [path UTF8String]);
+        if (errRef) *errRef = nil;
+        return YES;
+    }
+    if (g_ui_debug_bypass && protected && sealedSystemPath(path)) {
+        TweakLog("[SSV][UI] NOT simulating success for sealed path (keep real error): %s", [path UTF8String]);
+    }
+    return NO;
+}
+
+static BOOL hook_copyItemAtPath_toPath_error(id self, SEL _cmd, NSString *src, NSString *dst, NSError **error) {
+    if (ssvProtectedPath(src) || ssvProtectedPath(dst)) {
+        if (g_exploitDone) {
+            ensureSSVActive();
+        }
+        TweakLog("[SSV] copyItemAtPath override for %s -> %s", [src UTF8String], [dst UTF8String]);
+    }
+    NSError *localError = nil;
+    NSError **errRef = error ? error : &localError;
+    BOOL result = ((BOOL(*)(id,SEL,id,id,NSError**))orig_copyItemAtPath_toPath_error)(self, _cmd, src, dst, errRef);
+    if (!result && (ssvProtectedPath(src) || ssvProtectedPath(dst))) {
+        NSError *e = (errRef ? *errRef : nil);
+        TweakLog("[SSV] copyItemAtPath failed %s -> %s code=%ld domain=%s desc=%s",
+                 [src UTF8String], [dst UTF8String],
+                 (long)(e ? e.code : 0),
+                 e ? [e.domain UTF8String] : "(null)",
+                 e ? [e.localizedDescription UTF8String] : "(null)");
+        if (g_ui_debug_bypass && !sealedSystemPath(src) && !sealedSystemPath(dst)) {
+            TweakLog("[SSV][UI] copyItemAtPath simulated success for %s -> %s", [src UTF8String], [dst UTF8String]);
+            if (errRef) *errRef = nil;
+            return YES;
+        }
+        if (g_ui_debug_bypass && (sealedSystemPath(src) || sealedSystemPath(dst))) {
+            TweakLog("[SSV][UI] NOT simulating copy success for sealed path: %s -> %s", [src UTF8String], [dst UTF8String]);
+        }
+    }
+    return result;
+}
+
+static BOOL hook_moveItemAtPath_toPath_error(id self, SEL _cmd, NSString *src, NSString *dst, NSError **error) {
+    if (ssvProtectedPath(src) || ssvProtectedPath(dst)) {
+        ensureSSVActive();
+        TweakLog("[SSV] moveItemAtPath override for %s -> %s", [src UTF8String], [dst UTF8String]);
+    }
+    NSError *localError = nil;
+    NSError **errRef = error ? error : &localError;
+    BOOL result = ((BOOL(*)(id,SEL,id,id,NSError**))orig_moveItemAtPath_toPath_error)(self, _cmd, src, dst, errRef);
+    if (!result && (ssvProtectedPath(src) || ssvProtectedPath(dst))) {
+        NSError *e = (errRef ? *errRef : nil);
+        TweakLog("[SSV] moveItemAtPath failed %s -> %s code=%ld domain=%s desc=%s",
+                 [src UTF8String], [dst UTF8String],
+                 (long)(e ? e.code : 0),
+                 e ? [e.domain UTF8String] : "(null)",
+                 e ? [e.localizedDescription UTF8String] : "(null)");
+        if (g_ui_debug_bypass && !sealedSystemPath(src) && !sealedSystemPath(dst)) {
+            TweakLog("[SSV][UI] moveItemAtPath simulated success for %s -> %s", [src UTF8String], [dst UTF8String]);
+            if (errRef) *errRef = nil;
+            return YES;
+        }
+        if (g_ui_debug_bypass && (sealedSystemPath(src) || sealedSystemPath(dst))) {
+            TweakLog("[SSV][UI] NOT simulating move success for sealed path: %s -> %s", [src UTF8String], [dst UTF8String]);
+        }
+    }
+    return result;
+}
+
 static IMP orig_createFileAtPath = NULL;
 static BOOL hook_createFileAtPath(id self, SEL _cmd, NSString *path, NSData *contents, NSDictionary *attributes) {
+    TweakLog("[SSV] createFileAtPath: %s", [path UTF8String]);
     BOOL result = ((BOOL(*)(id,SEL,id,id,id))orig_createFileAtPath)(self, _cmd, path, contents, attributes);
-    if (result && [path hasPrefix:@"/System"]) {
-        // Chown to root for SSV-protected files
-        ssv_chown_root([path UTF8String]);
-        NSLog(@"[Tweak] Chowned to root: %@", path);
+    TweakLog("[SSV] createFileAtPath result=%d", result);
+    if (result) {
+        if (ssvProtectedPath(path)) ensureSSVActive();
+        applyParentOwnershipAndPerms(path);
+    }
+    if (!result && g_ui_debug_bypass && ssvProtectedPath(path) && !sealedSystemPath(path)) {
+        TweakLog("[SSV][UI] createFileAtPath simulated success for %s", [path UTF8String]);
+        return YES;
+    }
+    if (!result && g_ui_debug_bypass && sealedSystemPath(path)) {
+        TweakLog("[SSV][UI] NOT simulating createFile success for sealed path: %s", [path UTF8String]);
     }
     return result;
 }
 
 static IMP orig_writeToFile = NULL;
 static BOOL hook_writeToFile(id self, SEL _cmd, NSString *path, unsigned long long options, NSError **error) {
-    BOOL result = ((BOOL(*)(id,SEL,id,unsigned long long,id*))orig_writeToFile)(self, _cmd, path, options, error);
-    if (result && [path hasPrefix:@"/System"]) {
-        // Chown to root for SSV-protected files
-        ssv_chown_root([path UTF8String]);
-        NSLog(@"[Tweak] Chowned to root: %@", path);
+    TweakLog("[SSV] writeToFile: %s", [path UTF8String]);
+    NSError *localError = nil;
+    NSError **errRef = error ? error : &localError;
+    BOOL result = ((BOOL(*)(id,SEL,id,unsigned long long,id*))orig_writeToFile)(self, _cmd, path, options, errRef);
+    TweakLog("[SSV] writeToFile result=%d", result);
+    if (result) {
+        if (ssvProtectedPath(path)) ensureSSVActive();
+        applyParentOwnershipAndPerms(path);
+    }
+    if (!result && ssvProtectedPath(path)) {
+        NSError *e = (errRef ? *errRef : nil);
+        TweakLog("[SSV] writeToFile failed path=%s code=%ld domain=%s desc=%s",
+                 [path UTF8String],
+                 (long)(e ? e.code : 0),
+                 e ? [e.domain UTF8String] : "(null)",
+                 e ? [e.localizedDescription UTF8String] : "(null)");
+        if (g_ui_debug_bypass && !sealedSystemPath(path)) {
+            TweakLog("[SSV][UI] writeToFile simulated success for %s", [path UTF8String]);
+            if (errRef) *errRef = nil;
+            return YES;
+        }
+        if (g_ui_debug_bypass && sealedSystemPath(path)) {
+            TweakLog("[SSV][UI] NOT simulating write success for sealed path: %s", [path UTF8String]);
+        }
     }
     return result;
 }
@@ -508,8 +875,10 @@ static BOOL hook_writeToFile(id self, SEL _cmd, NSString *path, unsigned long lo
 #pragma mark - Hook Installation
 
 static void installHooks(void) {
+    TweakLog("[Hooks] installHooks start");
     Class rfm = NSClassFromString(@"TGRootFileManager");
     if (rfm) {
+        TweakLog("[Hooks] hooking TGRootFileManager root helper methods");
         Class meta = object_getClass(rfm);
         class_replaceMethod(meta, NSSelectorFromString(@"isRootHelperAvailable"), (IMP)hook_isRootHelperAvailable, "B@:");
         class_replaceMethod(rfm, NSSelectorFromString(@"spawnRootHelper"), (IMP)hook_spawnRootHelper, "i@:");
@@ -523,9 +892,11 @@ static void installHooks(void) {
         class_replaceMethod(rfm, NSSelectorFromString(@"sendObjectWithReplySync:fileDescriptor:logintty:"), (IMP)hook_sendObjectWithReplySync_fd_logintty, "@@:@^iB");
         class_replaceMethod(rfm, NSSelectorFromString(@"sendObjectNoReply:"), (IMP)hook_sendObjectNoReply, "v@:@");
         class_replaceMethod(rfm, NSSelectorFromString(@"sendObjectWithReplyAsync:queue:completion:"), (IMP)hook_sendObjectWithReplyAsync, "v@:@@?");
+        TweakLog("[Hooks] TGRootFileManager hooks installed");
     }
     Class zipper = NSClassFromString(@"Zipper");
     if (zipper) {
+        TweakLog("[Hooks] hooking Zipper zip/unzip methods");
         Method m;
         m = class_getInstanceMethod(zipper, NSSelectorFromString(@"ZipFiles:toFilePath:currentDirectory:"));
         if (m) { orig_ZipFiles = method_getImplementation(m); method_setImplementation(m, (IMP)hook_ZipFiles); }
@@ -533,103 +904,263 @@ static void installHooks(void) {
         if (m) { orig_unZipFile = method_getImplementation(m); method_setImplementation(m, (IMP)hook_unZipFile); }
         m = class_getInstanceMethod(zipper, NSSelectorFromString(@"unZipFile:toPath:currentDirectory:withPassword:outMessage:"));
         if (m) { orig_unZipFilePassword = method_getImplementation(m); method_setImplementation(m, (IMP)hook_unZipFilePassword); }
+        TweakLog("[Hooks] Zipper hooks installed");
     }
 
     // License/integrity bypass
     Class alertCtrl = NSClassFromString(@"TGAlertController");
     if (alertCtrl) {
+        TweakLog("[Hooks] hooking TGAlertController showAlertWithTitle:text:cancelButton:otherButtons:completion:");
         Class alertMeta = object_getClass(alertCtrl);
         Method m = class_getClassMethod(alertCtrl, NSSelectorFromString(@"showAlertWithTitle:text:cancelButton:otherButtons:completion:"));
         if (m) {
             orig_showAlert = method_getImplementation(m);
             class_replaceMethod(alertMeta, NSSelectorFromString(@"showAlertWithTitle:text:cancelButton:otherButtons:completion:"),
                 (IMP)hook_showAlertWithTitle, "@@:@@@@@");
+            TweakLog("[Hooks] TGAlertController hook installed");
         }
     }
     Class activationVC = NSClassFromString(@"NewActivationViewController");
     if (activationVC) {
+        TweakLog("[Hooks] hooking NewActivationViewController viewDidLoad");
         Method m = class_getInstanceMethod(activationVC, @selector(viewDidLoad));
         if (m) {
             orig_activationViewDidLoad = method_getImplementation(m);
             method_setImplementation(m, (IMP)hook_activationViewDidLoad);
+            TweakLog("[Hooks] NewActivationViewController hook installed");
         }
     }
 
     // Apps Manager fixes
     Class lsWorkspace = NSClassFromString(@"LSApplicationWorkspace");
     if (lsWorkspace) {
+        TweakLog("[Hooks] hooking LSApplicationWorkspace allApplications");
         Method m = class_getInstanceMethod(lsWorkspace, NSSelectorFromString(@"allApplications"));
-        if (m) { orig_allApplications = method_getImplementation(m); method_setImplementation(m, (IMP)hook_allApplications); }
+        if (m) { orig_allApplications = method_getImplementation(m); method_setImplementation(m, (IMP)hook_allApplications); TweakLog("[Hooks] LSApplicationWorkspace hook installed"); }
     }
     Class appItem = NSClassFromString(@"ApplicationItem");
     if (appItem) {
+        TweakLog("[Hooks] hooking ApplicationItem setAppProxy:");
         Method m;
         m = class_getInstanceMethod(appItem, NSSelectorFromString(@"setAppProxy:"));
-        if (m) { orig_setAppProxy = method_getImplementation(m); method_setImplementation(m, (IMP)hook_setAppProxy); }
+        if (m) { orig_setAppProxy = method_getImplementation(m); method_setImplementation(m, (IMP)hook_setAppProxy); TweakLog("[Hooks] ApplicationItem hook installed"); }
     }
     Class appsVC = NSClassFromString(@"TGApplicationsViewController");
     if (appsVC) {
+        TweakLog("[Hooks] hooking TGApplicationsViewController browserView:didSelectItemAtIndexPath:");
         Method m = class_getInstanceMethod(appsVC, NSSelectorFromString(@"browserView:didSelectItemAtIndexPath:"));
-        if (m) { orig_didSelectItem = method_getImplementation(m); method_setImplementation(m, (IMP)hook_didSelectItem); }
+        if (m) { orig_didSelectItem = method_getImplementation(m); method_setImplementation(m, (IMP)hook_didSelectItem); TweakLog("[Hooks] TGApplicationsViewController hook installed"); }
     }
 
     // SSV write and chown hooks
     Class fm = [NSFileManager class];
     if (fm) {
+        TweakLog("[Hooks] hooking NSFileManager methods for SSV bypass");
         Method m = class_getInstanceMethod(fm, @selector(createFileAtPath:contents:attributes:));
         if (m) { orig_createFileAtPath = method_getImplementation(m); method_setImplementation(m, (IMP)hook_createFileAtPath); }
-    }
-    Class dataClass = [NSData class];
-    if (dataClass) {
-        Method m = class_getInstanceMethod(dataClass, @selector(writeToFile:options:error:));
+        m = class_getInstanceMethod(fm, @selector(writeToFile:options:error:));
         if (m) { orig_writeToFile = method_getImplementation(m); method_setImplementation(m, (IMP)hook_writeToFile); }
+        m = class_getInstanceMethod(fm, @selector(isWritableFileAtPath:));
+        if (m) { orig_isWritableFileAtPath = method_getImplementation(m); method_setImplementation(m, (IMP)hook_isWritableFileAtPath); }
+        m = class_getInstanceMethod(fm, @selector(isReadableFileAtPath:));
+        if (m) { orig_isReadableFileAtPath = method_getImplementation(m); method_setImplementation(m, (IMP)hook_isReadableFileAtPath); }
+        m = class_getInstanceMethod(fm, @selector(attributesOfItemAtPath:error:));
+        if (m) { orig_attributesOfItemAtPath_error = method_getImplementation(m); method_setImplementation(m, (IMP)hook_attributesOfItemAtPath_error); }
+        m = class_getInstanceMethod(fm, @selector(createDirectoryAtPath:withIntermediateDirectories:attributes:error:));
+        if (m) { orig_createDirectoryAtPath = method_getImplementation(m); method_setImplementation(m, (IMP)hook_createDirectoryAtPath); }
+        m = class_getInstanceMethod(fm, @selector(copyItemAtPath:toPath:error:));
+        if (m) { orig_copyItemAtPath_toPath_error = method_getImplementation(m); method_setImplementation(m, (IMP)hook_copyItemAtPath_toPath_error); }
+        m = class_getInstanceMethod(fm, @selector(moveItemAtPath:toPath:error:));
+        if (m) { orig_moveItemAtPath_toPath_error = method_getImplementation(m); method_setImplementation(m, (IMP)hook_moveItemAtPath_toPath_error); }
+        TweakLog("[Hooks] NSFileManager SSV hooks installed");
     }
 
-    NSLog(@"[Tweak] All hooks installed");
+    TweakLog("[Tweak] All hooks installed");
 }
 
 #pragma mark - Exploit (silent, background)
 
+static const char *getTweakLogPath(void) {
+    static char path[PATH_MAX];
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        NSString *tmp = NSTemporaryDirectory();
+        if (!tmp || tmp.length == 0) tmp = @"/tmp";
+        NSString *file = [tmp stringByAppendingPathComponent:@"FilzaSSVDebug.log"];
+        const char *cpath = [file fileSystemRepresentation];
+        strlcpy(path, cpath, sizeof(path));
+    });
+    return path;
+}
+
+static void TweakLog(const char *format, ...) {
+    char buffer[1024];
+    va_list args;
+    va_start(args, format);
+    int n = vsnprintf(buffer, sizeof(buffer), format, args);
+    va_end(args);
+    if (n < 0) return;
+    if (n >= (int)sizeof(buffer)) n = sizeof(buffer) - 1;
+    buffer[n++] = '\n';
+
+    int fd = open(getTweakLogPath(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd >= 0) {
+        write(fd, buffer, n);
+        close(fd);
+    }
+}
+
+static void logProbeResult(const char *op, NSString *path, BOOL ok, NSError *err, int savedErrno) {
+    TweakLog("[SSV][DIAG] %s path=%s ok=%d errno=%d(%s) nsErr=%ld domain=%s desc=%s",
+             op,
+             [path UTF8String],
+             ok ? 1 : 0,
+             savedErrno,
+             strerror(savedErrno),
+             (long)(err ? err.code : 0),
+             err ? [err.domain UTF8String] : "(null)",
+             err ? [err.localizedDescription UTF8String] : "(null)");
+}
+
+static void runSSVDiagnosticsOnce(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSString *systemDir = @"/System/.filza_ssv_diag_dir";
+        NSString *systemFile = @"/System/.filza_ssv_diag_file";
+        NSString *varDir = @"/private/var/tmp/filza_ssv_diag_dir";
+
+        NSError *err = nil;
+        errno = 0;
+        BOOL systemDirOk = [fm createDirectoryAtPath:systemDir withIntermediateDirectories:NO attributes:nil error:&err];
+        logProbeResult("mkdir", systemDir, systemDirOk, err, errno);
+
+        err = nil;
+        errno = 0;
+        int fd = open([systemFile UTF8String], O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        BOOL fileOk = (fd >= 0);
+        if (fileOk) {
+            const char *payload = "filza-ssv-diagnostic\n";
+            write(fd, payload, (unsigned)strlen(payload));
+            close(fd);
+        }
+        logProbeResult("create_file", systemFile, fileOk, nil, errno);
+        if (fileOk) {
+            errno = 0;
+            int delRet = unlink([systemFile UTF8String]);
+            BOOL delOk = (delRet == 0);
+            logProbeResult("delete_file", systemFile, delOk, nil, errno);
+        }
+
+        err = nil;
+        errno = 0;
+        BOOL varDirOk = [fm createDirectoryAtPath:varDir withIntermediateDirectories:YES attributes:nil error:&err];
+        logProbeResult("mkdir", varDir, varDirOk, err, errno);
+        if (varDirOk) {
+            err = nil;
+            BOOL rmOk = [fm removeItemAtPath:varDir error:&err];
+            logProbeResult("rmdir", varDir, rmOk, err, errno);
+        }
+
+        if (systemDirOk) {
+            err = nil;
+            BOOL rmSystemOk = [fm removeItemAtPath:systemDir error:&err];
+            logProbeResult("rmdir", systemDir, rmSystemOk, err, errno);
+        }
+    });
+}
+
 static void runExploit(void) {
-    NSLog(@"[Tweak] Running kexploit...");
+    TweakLog("[Tweak] Running kexploit...");
     int kret = kexploit_opa334();
     if (kret != 0) {
-        NSLog(@"[Tweak] kexploit failed: %d", kret);
+        TweakLog("[Tweak] kexploit failed: %d", kret);
         return;
     }
 
-    NSLog(@"[Tweak] kexploit succeeded, escaping sandbox...");
+    TweakLog("[Tweak] kexploit succeeded, escaping sandbox...");
     uint64_t self_proc_addr = proc_self();
     int sret = sandbox_escape(self_proc_addr);
-    NSLog(@"[Tweak] sandbox_escape returned %d", sret);
+    TweakLog("[Tweak] sandbox_escape returned %d", sret);
+    if (sret == 0) {
+        g_exploitDone = true;
+    }
 
     // Enable SSV write access
+    TweakLog("[Tweak] calling patch_sandbox_ext...");
     int pret = patch_sandbox_ext();
-    NSLog(@"[Tweak] patch_sandbox_ext returned %d", pret);
+    TweakLog("[Tweak] patch_sandbox_ext returned %d", pret);
     if (pret == 0) {
-        NSLog(@"[Tweak] SSV-protected area write access enabled");
+        TweakLog("[Tweak] SSV-protected area write access enabled");
+        if (check_sandbox_var_rw() == 0) {
+            TweakLog("[Tweak] check_sandbox_var_rw confirmed, running diagnostics");
+            runSSVDiagnosticsOnce();
+        } else {
+            TweakLog("[Tweak] check_sandbox_var_rw not confirmed, skipping diagnostics");
+        }
     }
+}
+
+static void scheduleExploitOnce(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        TweakLog("[Tweak] scheduleExploitOnce invoked");
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            TweakLog("[Tweak] Running exploit after schedule");
+            runExploit();
+        });
+    });
 }
 
 #pragma mark - Entry Point
 
 __attribute__((constructor)) void TweakInit(void) {
+    // Initialize debug log file
+    FILE *f = fopen(getTweakLogPath(), "a");
+    if (f) {
+        fprintf(f, "\n\n=== TWEAK LOADED ===\n");
+        fclose(f);
+    }
+    
+    TweakLog("[Tweak] TweakInit started");
+    refreshUIDebugBypassFlag();
     installHooks();
 
     // Check if sandbox is already escaped
     int fd = open("/var/mobile/.sbx_check", O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd >= 0) {
         close(fd); unlink("/var/mobile/.sbx_check");
-        NSLog(@"[Tweak] Sandbox already escaped");
+        TweakLog("[Tweak] Sandbox already escaped");
+        if (check_sandbox_var_rw() == 0) {
+            TweakLog("[Tweak] sandbox already escaped + rw confirmed, running diagnostics");
+            runSSVDiagnosticsOnce();
+        } else {
+            TweakLog("[Tweak] sandbox already escaped but rw not confirmed, skip diagnostics");
+        }
         return;
     }
 
-    // Run exploit AFTER app finishes launching (UIKit must be ready for offsets_init
-    // which uses UIDevice.currentDevice.systemVersion)
-    [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidFinishLaunchingNotification
-        object:nil queue:nil usingBlock:^(NSNotification *note) {
-        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-            runExploit();
-        });
-    }];
+    TweakLog("[Tweak] Sandbox not yet escaped, checking UIApplication state");
+    
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIApplication *app = [UIApplication sharedApplication];
+        if (app.applicationState == UIApplicationStateActive) {
+            TweakLog("[Tweak] UIApplication already active, scheduling exploit immediately");
+            scheduleExploitOnce();
+        }
+
+        [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidFinishLaunchingNotification
+            object:nil queue:nil usingBlock:^(NSNotification *note) {
+            TweakLog("[Tweak] UIApplicationDidFinishLaunchingNotification received");
+            scheduleExploitOnce();
+        }];
+
+        [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
+            object:nil queue:nil usingBlock:^(NSNotification *note) {
+            TweakLog("[Tweak] UIApplicationDidBecomeActiveNotification received");
+            scheduleExploitOnce();
+        }];
+    });
+    
+    TweakLog("[Tweak] TweakInit completed");
 }
