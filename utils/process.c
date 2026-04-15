@@ -5,11 +5,17 @@
 //  Created by seo on 3/26/26.
 //
 
+#include <stddef.h>
+#include <mach/arm/thread_status.h>
 #include "process.h"
 #include "../kexploit/kutils.h"
 #include "../kexploit/krw.h"
 #include "../kexploit/xpaci.h"
 #include "../kexploit/offsets.h"
+
+#ifndef offsetof
+#define offsetof(type, member) __builtin_offsetof(type, member)
+#endif
 
 int crash_process(const char* name) {
     uint64_t proc = proc_find_by_name(name);
