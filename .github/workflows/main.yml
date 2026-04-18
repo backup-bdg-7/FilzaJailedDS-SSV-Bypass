@@ -1,0 +1,38 @@
+name: Build FilzaJailedDS
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch: # Allows manual triggers
+
+jobs:
+  build:
+    runs-on: macos-latest  # macOS is preferred for iOS toolchains
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive # Important for your kexploit/XPF folders
+
+      - name: Setup Theos
+        uses: theos/setup-theos@v1
+        with:
+          # You can specify a specific SDK version if needed
+          # target-sdk: 15.0 
+
+      - name: Build Package
+        run: |
+          export THEOS=$GITHUB_WORKSPACE/theos
+          make package FINALPACKAGE=1
+        env:
+          # This ensures the compiler finds the correct architectures
+          ARCHS: "arm64 arm64e"
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FilzaApplySandboxExt-Deb
+          path: packages/*.deb
