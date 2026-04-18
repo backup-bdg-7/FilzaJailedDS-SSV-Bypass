@@ -5,31 +5,28 @@ on:
     branches: [ main ]
   pull_request:
     branches: [ main ]
-  workflow_dispatch: # Allows manual triggers
+  workflow_dispatch:
 
 jobs:
   build:
-    runs-on: macos-latest  # macOS is preferred for iOS toolchains
+    runs-on: macos-latest
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          submodules: recursive # Important for your kexploit/XPF folders
+          submodules: recursive
 
       - name: Setup Theos
         uses: theos/setup-theos@v1
-        with:
-          # You can specify a specific SDK version if needed
-          # target-sdk: 15.0 
 
       - name: Build Package
-        run: |
-          export THEOS=$GITHUB_WORKSPACE/theos
-          make package FINALPACKAGE=1
+        # The environment variables are moved to their own 'env' block
+        # and we use the $THEOS variable provided by the setup action
+        run: make package FINALPACKAGE=1
         env:
-          # This ensures the compiler finds the correct architectures
-          ARCHS: "arm64 arm64e"
+          ARCHS: arm64 arm64e
+          # THEOS is automatically set by the setup-theos action
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
