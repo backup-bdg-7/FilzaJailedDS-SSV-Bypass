@@ -3,13 +3,11 @@ name: Build FilzaJailedDS
 on:
   push:
     branches: [ main ]
-  pull_request:
-    branches: [ main ]
   workflow_dispatch:
 
 jobs:
   build:
-    runs-on: macos-latest
+    runs-on: macos-13 # Using macOS 13 for better compatibility with older iOS SDKs
 
     steps:
       - name: Checkout code
@@ -20,13 +18,25 @@ jobs:
       - name: Setup Theos
         uses: theos/setup-theos@v1
 
+      - name: Cache iOS SDK
+        id: sdk-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.THEOS }}/sdks
+          key: ios-sdk-15.0
+
+      - name: Download iOS SDK
+        if: steps.sdk-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --quiet --depth=1 https://github.com/theos/sdks.git $THEOS/sdks
+
       - name: Build Package
-        # The environment variables are moved to their own 'env' block
-        # and we use the $THEOS variable provided by the setup action
-        run: make package FINALPACKAGE=1
+        run: |
+          # We use the $THEOS provided by the setup-theos action
+          make package FINALPACKAGE=1
         env:
-          ARCHS: arm64 arm64e
-          # THEOS is automatically set by the setup-theos action
+          THEOS_DEVICE_IP: "" # Ensures no SSH attempt
+          ARCHS: "arm64 arm64e"
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
