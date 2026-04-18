@@ -22,14 +22,19 @@ jobs:
         id: sdk-cache
         uses: actions/cache@v4
         with:
-          path: ${{ env.THEOS }}/sdks
+          # Using the standard path the action sets up
+          path: ${{ github.workspace }}/theos/sdks
           key: ios-sdk-15.0
 
       - name: Download iOS SDK
+        # Only run if cache missed AND the directory doesn't already have the SDK
         if: steps.sdk-cache.outputs.cache-hit != 'true'
         run: |
-          # Theos action sets $THEOS automatically
-          git clone --quiet --depth=1 https://github.com/theos/sdks.git $THEOS/sdks
+          mkdir -p $THEOS/sdks
+          # Using a temporary clone to avoid the "directory not empty" error
+          git clone --quiet --depth=1 https://github.com/theos/sdks.git temp_sdks
+          cp -rn temp_sdks/* $THEOS/sdks/
+          rm -rf temp_sdks
 
       - name: Build Package
         run: |
@@ -37,6 +42,8 @@ jobs:
         env:
           THEOS_DEVICE_IP: "" 
           ARCHS: "arm64 arm64e"
+          # Explicitly point to the local theos directory
+          THEOS: ${{ github.workspace }}/theos
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
