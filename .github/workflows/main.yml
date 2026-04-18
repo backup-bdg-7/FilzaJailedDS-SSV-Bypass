@@ -7,7 +7,7 @@ on:
 
 jobs:
   build:
-    runs-on: macos-latest # Using macOS 13 for better compatibility with older iOS SDKs
+    runs-on: macos-latest
 
     steps:
       - name: Checkout code
@@ -16,7 +16,7 @@ jobs:
           submodules: recursive
 
       - name: Setup Theos
-        uses: theos/setup-theos@v1
+        uses: theos/setup-theos@master # Using the master branch reference for the official repo
 
       - name: Cache iOS SDK
         id: sdk-cache
@@ -28,14 +28,17 @@ jobs:
       - name: Download iOS SDK
         if: steps.sdk-cache.outputs.cache-hit != 'true'
         run: |
-          git clone --quiet --depth=1 https://github.com/theos/sdks.git $THEOS/sdks
+          mkdir -p $THEOS/sdks
+          curl -LO https://github.com/theos/sdks/archive/master.zip
+          unzip -q master.zip
+          mv sdks-master/* $THEOS/sdks/
+          rm -rf sdks-master master.zip
 
       - name: Build Package
         run: |
-          # We use the $THEOS provided by the setup-theos action
           make package FINALPACKAGE=1
         env:
-          THEOS_DEVICE_IP: "" # Ensures no SSH attempt
+          THEOS_DEVICE_IP: "" 
           ARCHS: "arm64 arm64e"
 
       - name: Upload Artifact
